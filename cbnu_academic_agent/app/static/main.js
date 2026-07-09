@@ -17,6 +17,7 @@ const syncStatus = document.getElementById("sync-status");
 const calendarSummary = document.getElementById("calendar-summary");
 const calendarMonth = document.getElementById("calendar-month");
 const calendarGrid = document.getElementById("calendar-grid");
+const calendarDetail = document.getElementById("calendar-detail");
 const calendarList = document.getElementById("calendar-list");
 const changeList = document.getElementById("change-list");
 const prevMonth = document.getElementById("prev-month");
@@ -175,6 +176,11 @@ toggleCalendarRange.addEventListener("click", () => {
   renderCalendar();
 });
 refreshChanges.addEventListener("click", loadChanges);
+calendarGrid.addEventListener("click", (e) => {
+  const day = e.target.closest(".calendar-day");
+  if (!day) return;
+  renderDayDetail(day.dataset.date);
+});
 
 async function loadCalendar() {
   const res = await fetch("/api/calendar");
@@ -218,6 +224,7 @@ function renderCalendarSummary(events) {
 function renderCalendar() {
   renderCalendarSummary(calendarEvents);
   toggleCalendarRange.textContent = showFullCalendarRange ? "월간 보기" : "전체 보기";
+  calendarDetail.innerHTML = "";
 
   if (showFullCalendarRange) {
     calendarGrid.className = "calendar-range";
@@ -291,7 +298,7 @@ function calendarGridHtml(monthDate, eventsByDate) {
     const today = dateText === todayText ? " today" : "";
     const badges = dayEvents.slice(0, 3).map((event) => eventBadgeHtml(event)).join("");
     const more = dayEvents.length > 3 ? `<span class="event-more">+${dayEvents.length - 3}</span>` : "";
-    cells.push(`<button class="calendar-day${outside}${today}" type="button" title="${dateText}">
+    cells.push(`<button class="calendar-day${outside}${today}" type="button" title="${dateText}" data-date="${dateText}">
       <span class="day-number">${cellDate.getDate()}</span>
       <div class="day-events">${badges}${more}</div>
     </button>`);
@@ -331,6 +338,52 @@ function monthAgendaHtml(events) {
         <p>${event.evidence || ""}</p>
         ${source}
       </div>
+    </article>`;
+  }).join("");
+}
+
+function renderDayDetail(dateText) {
+  if (!dateText) return;
+  const dayEvents = calendarEvents.filter((event) => eventDate(event) === dateText);
+  if (dayEvents.length === 0) {
+    calendarDetail.innerHTML = `<section class="day-detail-panel">
+      <h3>${dateText}</h3>
+      <p class="empty-text">이 날짜에 등록된 일정이나 Todo가 없습니다.</p>
+    </section>`;
+    return;
+  }
+
+  const todos = dayEvents.filter((event) => event.change_type === "todo");
+  const schedules = dayEvents.filter((event) => event.change_type !== "todo");
+
+  calendarDetail.innerHTML = `<section class="day-detail-panel">
+    <div class="day-detail-header">
+      <h3>${dateText}</h3>
+      <span>${schedules.length}개 일정 · ${todos.length}개 Todo</span>
+    </div>
+    <div class="day-detail-columns">
+      <div>
+        <h4>일정</h4>
+        ${schedules.length ? dayDetailItemsHtml(schedules) : `<p class="empty-text">일정 없음</p>`}
+      </div>
+      <div>
+        <h4>Todo</h4>
+        ${todos.length ? dayDetailItemsHtml(todos) : `<p class="empty-text">Todo 없음</p>`}
+      </div>
+    </div>
+  </section>`;
+}
+
+function dayDetailItemsHtml(events) {
+  return events.map((event) => {
+    const source = event.source_url
+      ? `<a href="${event.source_url}" target="_blank" rel="noreferrer">출처</a>`
+      : "";
+    return `<article class="day-detail-item ${event.change_type === "todo" ? "todo" : ""}">
+      <b>${event.title}</b>
+      <span>${event.category} · ${event.importance} · ${event.change_type}</span>
+      <p>${event.evidence || ""}</p>
+      ${source}
     </article>`;
   }).join("");
 }

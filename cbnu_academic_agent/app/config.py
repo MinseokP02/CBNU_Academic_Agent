@@ -28,6 +28,13 @@ class Settings(BaseModel):
     openai_embedding_model: str = Field(
         default_factory=lambda: os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
     )
+    tavily_api_key: str | None = Field(default_factory=lambda: os.getenv("TAVILY_API_KEY"))
+    tavily_search_url: str = Field(default_factory=lambda: os.getenv("TAVILY_SEARCH_URL", "https://api.tavily.com/search"))
+    cbnu_department_notice_domains: List[str] = Field(
+        default_factory=lambda: parse_source_urls(
+            os.getenv("CBNU_DEPARTMENT_NOTICE_DOMAINS", "cbnu.ac.kr,chungbuk.ac.kr,software.cbnu.ac.kr,computer.chungbuk.ac.kr")
+        )
+    )
 
     crawl_timeout: int = Field(default_factory=lambda: int(os.getenv("CBNU_CRAWL_TIMEOUT", "10")))
     max_links: int = Field(default_factory=lambda: int(os.getenv("CBNU_MAX_LINKS", "40")))

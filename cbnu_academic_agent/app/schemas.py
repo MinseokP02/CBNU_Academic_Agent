@@ -32,12 +32,6 @@ class AcademicScheduleList(BaseModel):
     schedules: list[AcademicSchedule] = Field(default_factory=list)
 
 
-class RouteDecision(BaseModel):
-    route: Literal["academic_rag", "date_calc", "todo", "guardrail"]
-    reason: str = Field(..., description="라우팅 이유")
-    rewritten_query: str = Field(..., description="검색에 유리하게 바꾼 한국어 질의")
-
-
 class UploadResponse(BaseModel):
     filename: str
     chunks: int

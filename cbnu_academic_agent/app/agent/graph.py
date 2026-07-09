@@ -1,29 +1,37 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from datetime import date, datetime
 from typing import Annotated, Any, Literal, TypedDict
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph, add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agent.tools import (
+    academic_rag_tool,
+    cbnu_department_notice_tavily_tool,
     date_calculator_tool,
-    find_first_date,
-    realtime_cbnu_crawl_tool,
-    runtime_rag_search_tool,
     todo_breakdown_tool,
 )
 from app.config import get_settings
-from app.schemas import AcademicScheduleList, RouteDecision, SourceItem
+from app.schemas import AcademicScheduleList, SourceItem
 from app.services.profile_store import format_profile_context
 
 logger = logging.getLogger(__name__)
+
+AUTONOMOUS_TOOLS = [
+    academic_rag_tool,
+    cbnu_department_notice_tavily_tool,
+    date_calculator_tool,
+    todo_breakdown_tool,
+]
 
 
 class AgentState(TypedDict, total=False):
@@ -53,85 +61,52 @@ def _latest_user_message(state: AgentState) -> str:
     return state.get("query", "")
 
 
-def classify_request(state: AgentState) -> dict[str, Any]:
-    """사용자 요청을 보고 어떤 도구 흐름을 탈지 결정한다."""
+def agent_node(state: AgentState) -> dict[str, Any]:
+    """LLM이 필요한 도구를 자율적으로 선택해 tool call을 생성한다."""
     query = _latest_user_message(state)
-    llm = get_llm(temperature=0)
+    requested_date = date_from_request_metadata(state.get("request_metadata", {}))
     profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
+    llm = get_llm(temperature=0).bind_tools(AUTONOMOUS_TOOLS)
 
     system = SystemMessage(
         content=(
-            "너는 충북대학교 학사/공지/일정 관리 Agent의 라우터다. "
-            "사용자 요청을 academic_rag, date_calc, todo, guardrail 중 하나로 분류한다. "
-            "academic_rag는 충북대학교 학사일정, 공지, 수강신청, 장학, 졸업, 등록, 시험, 휴복학 질문이다. "
-            "date_calc는 사용자가 명시한 날짜까지 며칠 남았는지 계산하는 요청이다. "
-            "todo는 학사 일정, 신청, 준비 작업을 실행 가능한 할 일 목록으로 분해해 달라는 요청이다. "
-            "guardrail은 서비스 범위 밖 요청이다. 검색어는 한국어로 간결하게 재작성한다."
+            "너는 충북대학교 학사 일정 관리 Agent다. 사용자의 자연어 요청을 보고 필요한 도구를 직접 선택한다. "
+            "특정 학과, 학부, 전공, 단과대학 공지사항을 묻는 요청은 cbnu_department_notice_tavily_tool을 우선 호출한다. "
+            "도구 호출 시 department_name에는 사용자가 말한 학과명을 넣고, 사용자가 '내 학과', '우리 학과'처럼 표현하면 사용자 프로필의 학과명을 넣는다. "
+            "충북대학교 학사일정, 공지, 수강, 장학, 졸업, 등록, 시험, 휴복학 질문은 academic_rag_tool을 호출한다. "
+            "특정 날짜까지 남은 기간을 묻는 요청은 date_calculator_tool을 호출한다. "
+            "신청/준비/목표를 실행 가능한 할 일로 나누라는 요청은 todo_breakdown_tool을 호출한다. "
+            f"Todo 도구를 호출할 때 reference_date는 반드시 {requested_date.isoformat()}로 넣는다. "
+            "서비스 범위 밖 요청이면 도구를 호출하지 말고 이 서비스가 지원하는 범위를 짧게 안내한다. "
+            "사용자 프로필이 있으면 도구 query나 goal에 학과, 학년, 관심 항목을 반영한다."
         )
     )
     profile_message = SystemMessage(content=f"사용자 프로필:\n{profile_context}")
-
-    try:
-        decision = llm.with_structured_output(RouteDecision).invoke(
-            [system, profile_message, *state.get("messages", [])]
-        )
-    except Exception as exc:  # API 일시 오류 시 키워드 기반 fallback
-        logger.exception("route classification failed: %s", exc)
-        academic_keywords = ["충북", "학사", "공지", "수강", "장학", "졸업", "등록", "시험", "휴학", "복학", "일정"]
-        if any(k in query for k in academic_keywords):
-            decision = RouteDecision(route="academic_rag", reason="키워드 기반 fallback", rewritten_query=query)
-        elif find_first_date(query):
-            decision = RouteDecision(route="date_calc", reason="날짜 표현 감지 fallback", rewritten_query=query)
-        elif any(k in query for k in ["todo", "할 일", "체크리스트", "쪼개", "분해"]):
-            decision = RouteDecision(route="todo", reason="Todo 요청 fallback", rewritten_query=query)
-        else:
-            decision = RouteDecision(route="guardrail", reason="서비스 범위 외 fallback", rewritten_query=query)
+    result = llm.invoke([system, profile_message, *state.get("messages", [])])
+    route = infer_route_from_tool_calls(result)
 
     return {
         "query": query,
-        "route": decision.route,
-        "route_reason": decision.reason,
-        "rewritten_query": decision.rewritten_query,
+        "route": route,
+        "route_reason": "LLM bind_tools 기반 도구 선택",
+        "answer": str(result.content) if result.content else state.get("answer", ""),
+        "messages": [result],
         "iterations": state.get("iterations", 0),
     }
 
 
-def route_condition(state: AgentState) -> str:
-    return state.get("route", "guardrail")
-
-
-def crawl_node(state: AgentState) -> dict[str, Any]:
-    query = state.get("rewritten_query") or state.get("query") or _latest_user_message(state)
-    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
-    if profile_context != "설정된 사용자 프로필 없음":
-        query = f"{query}\n{profile_context}"
-    docs = realtime_cbnu_crawl_tool.invoke({"query": query})
-    return {"raw_docs": docs, "iterations": state.get("iterations", 0) + 1}
-
-
-def rag_search_node(state: AgentState) -> dict[str, Any]:
-    query = state.get("rewritten_query") or state.get("query") or _latest_user_message(state)
-    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
-    if profile_context != "설정된 사용자 프로필 없음":
-        query = f"{query}\n{profile_context}"
-    docs = state.get("raw_docs", [])
-    results = runtime_rag_search_tool.invoke({"query": query, "documents": docs, "k": 5})
-    return {"context_docs": results}
-
-
-def should_retry_search(state: AgentState) -> str:
-    if state.get("context_docs"):
-        return "extract"
-    if state.get("iterations", 0) < 2:
-        return "retry"
-    return "extract"
-
-
-def expand_query_node(state: AgentState) -> dict[str, Any]:
-    original = state.get("query") or _latest_user_message(state)
-    return {
-        "rewritten_query": f"충북대학교 학사일정 공지 수강 장학 졸업 등록 {original}",
-    }
+def infer_route_from_tool_calls(message: AIMessage) -> str:
+    tool_calls = getattr(message, "tool_calls", None) or []
+    names = {call.get("name") for call in tool_calls}
+    if "todo_breakdown_tool" in names:
+        return "todo"
+    if "date_calculator_tool" in names:
+        return "date_calc"
+    if "cbnu_department_notice_tavily_tool" in names:
+        return "academic_rag"
+    if "academic_rag_tool" in names:
+        return "academic_rag"
+    return "guardrail"
 
 
 def extract_schedule_node(state: AgentState) -> dict[str, Any]:
@@ -141,7 +116,10 @@ def extract_schedule_node(state: AgentState) -> dict[str, Any]:
         return {"schedules": []}
 
     context_text = "\n\n".join(
-        f"[출처 {idx + 1}] {doc.get('title')}\nURL: {doc.get('source')}\n본문: {doc.get('content', '')[:1200]}"
+        f"[출처 {idx + 1}] {doc.get('title')}\n"
+        f"게시일 추정: {doc.get('published_date') or '알 수 없음'}\n"
+        f"URL: {doc.get('source')}\n"
+        f"본문: {doc.get('content', '')[:1200]}"
         for idx, doc in enumerate(context_docs)
     )
 
@@ -181,7 +159,10 @@ def answer_node(state: AgentState) -> dict[str, Any]:
     profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
 
     context_text = "\n\n".join(
-        f"[문서 {idx + 1}] {doc.get('title')}\nURL: {doc.get('source')}\n{doc.get('content', '')[:1400]}"
+        f"[문서 {idx + 1}] {doc.get('title')}\n"
+        f"게시일 추정: {doc.get('published_date') or '알 수 없음'}\n"
+        f"URL: {doc.get('source')}\n"
+        f"{doc.get('content', '')[:1400]}"
         for idx, doc in enumerate(context_docs)
     )
 
@@ -194,6 +175,7 @@ def answer_node(state: AgentState) -> dict[str, Any]:
                 "너는 충북대학교 학생을 위한 학사 일정 관리 Agent다. "
                 "검색 문맥에 근거해서만 답하고, 불확실하면 불확실하다고 말한다. "
                 "사용자 프로필이 있으면 학과, 학년, 관심 항목과 관련성이 높은 내용을 우선해서 답한다. "
+                "공지사항 검색 결과는 게시일 추정 값이 있으면 최신순으로 정리한다. "
                 "중요 일정은 날짜, 마감일, 해야 할 일을 중심으로 정리한다. "
                 "마지막에는 확인한 출처 제목을 짧게 제시한다."
             ),
@@ -213,35 +195,6 @@ def answer_node(state: AgentState) -> dict[str, Any]:
     )
     content = str(result.content)
     return {"answer": content, "messages": [AIMessage(content=content)]}
-
-
-def date_calc_node(state: AgentState) -> dict[str, Any]:
-    query = state.get("query") or _latest_user_message(state)
-    date_text = find_first_date(query)
-    if not date_text:
-        content = "계산할 날짜를 YYYY-MM-DD 형식으로 함께 입력해 주세요. 예: 2026-08-05까지 며칠 남았어?"
-    else:
-        content = date_calculator_tool.invoke({"date_text": date_text})
-    return {"answer": content, "messages": [AIMessage(content=content)]}
-
-
-def guardrail_node(state: AgentState) -> dict[str, Any]:
-    content = (
-        "이 Agent는 충북대학교 학사 일정, 공지, 수강신청, 장학, 졸업, 등록 관련 질문을 돕기 위한 서비스입니다. "
-        "예를 들어 ‘이번 달 학사일정 알려줘’, ‘수강신청 공지 찾아줘’, ‘장학금 신청 마감일 정리해줘’처럼 질문해 주세요."
-    )
-    return {"answer": content, "messages": [AIMessage(content=content)]}
-
-
-def todo_node(state: AgentState) -> dict[str, Any]:
-    query = state.get("query") or _latest_user_message(state)
-    requested_date = date_from_request_metadata(state.get("request_metadata", {}))
-    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
-    goal = query if profile_context == "설정된 사용자 프로필 없음" else f"{query}\n\n사용자 프로필:\n{profile_context}"
-    todos = todo_breakdown_tool.invoke({"goal": goal, "reference_date": requested_date.isoformat()})
-    todos = filter_todos_from_date(todos, requested_date)
-    content = format_todo_answer(todos, requested_date)
-    return {"answer": content, "todos": todos, "messages": [AIMessage(content=content)]}
 
 
 def format_todo_answer(todos: list[dict[str, Any]], requested_date: date) -> str:
@@ -285,45 +238,102 @@ def filter_todos_from_date(todos: list[dict[str, Any]], requested_date: date) ->
     return filtered
 
 
+def process_tool_results_node(state: AgentState) -> dict[str, Any]:
+    """ToolNode 결과를 앱 응답 상태로 변환한다."""
+    requested_date = date_from_request_metadata(state.get("request_metadata", {}))
+    updates: dict[str, Any] = {}
+
+    for message in reversed(state.get("messages", [])):
+        if not isinstance(message, ToolMessage):
+            continue
+
+        tool_name = message.name
+        payload = parse_tool_payload(message.content)
+
+        if tool_name in {"academic_rag_tool", "cbnu_department_notice_tavily_tool"}:
+            docs = payload if isinstance(payload, list) else []
+            updates["route"] = "academic_rag"
+            updates["context_docs"] = docs
+            continue
+
+        if tool_name == "date_calculator_tool":
+            content = str(message.content)
+            updates["route"] = "date_calc"
+            updates["answer"] = content
+            updates["messages"] = [AIMessage(content=content)]
+            continue
+
+        if tool_name == "todo_breakdown_tool":
+            todos = payload if isinstance(payload, list) else []
+            todos = filter_todos_from_date(todos, requested_date)
+            content = format_todo_answer(todos, requested_date)
+            updates["route"] = "todo"
+            updates["todos"] = todos
+            updates["answer"] = content
+            updates["messages"] = [AIMessage(content=content)]
+            continue
+
+    if not updates:
+        updates["route"] = "guardrail"
+        updates["answer"] = latest_ai_content(state)
+    return updates
+
+
+def parse_tool_payload(content: Any) -> Any:
+    if not isinstance(content, str):
+        return content
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return ast.literal_eval(content)
+    except (ValueError, SyntaxError):
+        return content
+
+
+def latest_ai_content(state: AgentState) -> str:
+    for message in reversed(state.get("messages", [])):
+        if isinstance(message, AIMessage) and message.content:
+            return str(message.content)
+    return "응답을 생성하지 못했습니다."
+
+
+def route_after_tool_processing(state: AgentState) -> str:
+    if state.get("route") == "academic_rag":
+        return "extract_schedule"
+    return "end"
+
+
 def build_graph():
     graph = StateGraph(AgentState)
 
-    graph.add_node("classify_request", classify_request)
-    graph.add_node("crawl_realtime_web", crawl_node)
-    graph.add_node("rag_search", rag_search_node)
-    graph.add_node("expand_query", expand_query_node)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", ToolNode(AUTONOMOUS_TOOLS))
+    graph.add_node("process_tool_results", process_tool_results_node)
     graph.add_node("extract_schedule", extract_schedule_node)
     graph.add_node("answer", answer_node)
-    graph.add_node("date_calc", date_calc_node)
-    graph.add_node("todo", todo_node)
-    graph.add_node("guardrail", guardrail_node)
 
-    graph.add_edge(START, "classify_request")
+    graph.add_edge(START, "agent")
     graph.add_conditional_edges(
-        "classify_request",
-        route_condition,
+        "agent",
+        tools_condition,
         {
-            "academic_rag": "crawl_realtime_web",
-            "date_calc": "date_calc",
-            "todo": "todo",
-            "guardrail": "guardrail",
+            "tools": "tools",
+            END: END,
         },
     )
-    graph.add_edge("crawl_realtime_web", "rag_search")
+    graph.add_edge("tools", "process_tool_results")
     graph.add_conditional_edges(
-        "rag_search",
-        should_retry_search,
+        "process_tool_results",
+        route_after_tool_processing,
         {
-            "retry": "expand_query",
-            "extract": "extract_schedule",
+            "extract_schedule": "extract_schedule",
+            "end": END,
         },
     )
-    graph.add_edge("expand_query", "crawl_realtime_web")
     graph.add_edge("extract_schedule", "answer")
     graph.add_edge("answer", END)
-    graph.add_edge("date_calc", END)
-    graph.add_edge("todo", END)
-    graph.add_edge("guardrail", END)
 
     memory = InMemorySaver()
     return graph.compile(checkpointer=memory)
