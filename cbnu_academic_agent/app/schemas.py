@@ -32,14 +32,6 @@ class AcademicScheduleList(BaseModel):
     schedules: list[AcademicSchedule] = Field(default_factory=list)
 
 
-class ChatResponse(BaseModel):
-    answer: str
-    session_id: str
-    route: str
-    sources: list[SourceItem] = Field(default_factory=list)
-    schedules: list[AcademicSchedule] = Field(default_factory=list)
-
-
 class RouteDecision(BaseModel):
     route: Literal["academic_rag", "date_calc", "todo", "guardrail"]
     reason: str = Field(..., description="라우팅 이유")
@@ -83,6 +75,22 @@ class ChangeItem(BaseModel):
     detected_at: str
 
 
+class ProfileSettings(BaseModel):
+    session_id: str = Field(default="default", min_length=1, max_length=100)
+    name: Optional[str] = Field(default=None, max_length=100)
+    college: Optional[str] = Field(default=None, max_length=100)
+    department: Optional[str] = Field(default=None, max_length=100)
+    grade: Optional[str] = Field(default=None, max_length=50)
+    student_type: Optional[str] = Field(default=None, max_length=100)
+    interests: list[str] = Field(default_factory=list)
+    memo: str = Field(default="", max_length=1000)
+
+
+class ProfileResponse(BaseModel):
+    profile: ProfileSettings
+    message: str = ""
+
+
 class TodoBreakdownRequest(BaseModel):
     goal: str = Field(..., min_length=1, max_length=1000)
 
@@ -92,6 +100,16 @@ class TodoItem(BaseModel):
     due_date: Optional[str] = None
     priority: Literal["high", "medium", "low"] = "medium"
     reason: str = ""
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    session_id: str
+    route: str
+    sources: list[SourceItem] = Field(default_factory=list)
+    schedules: list[AcademicSchedule] = Field(default_factory=list)
+    todos: list[TodoItem] = Field(default_factory=list)
+    calendar_events: list[CalendarEvent] = Field(default_factory=list)
 
 
 class TodoBreakdownResponse(BaseModel):

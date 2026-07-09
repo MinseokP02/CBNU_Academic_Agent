@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import shutil
+from datetime import date, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -17,6 +18,8 @@ from app.schemas import (
     ChatRequest,
     ChatResponse,
     CrawlSyncResponse,
+    ProfileResponse,
+    ProfileSettings,
     TodoBreakdownRequest,
     TodoBreakdownResponse,
     UploadResponse,
@@ -30,6 +33,7 @@ from app.services.change_store import (
 )
 from app.services.academic_schedule import load_academic_schedule_range
 from app.services.crawler import crawl_realtime_sources
+from app.services.profile_store import get_profile, upsert_profile
 from app.services.todo import breakdown_todos
 from app.services.vector_db import PROFILE_COLLECTION, index_academic_documents, index_profile_pdf
 
@@ -54,13 +58,29 @@ def health():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, request: Request):
     if not settings.openai_api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY가 설정되어 있지 않습니다. .env를 확인하세요.")
 
     try:
-        result = invoke_agent(message=req.message, session_id=req.session_id)
+        agent_context = getattr(request.state, "agent_context", {})
+        profile = get_profile(req.session_id)
+        agent_context = {**agent_context, "profile": profile.model_dump()}
+        result = invoke_agent(
+            message=req.message,
+            session_id=req.session_id,
+            request_metadata=agent_context,
+        )
         store_schedules_to_calendar(result.get("schedules", []))
+        if result.get("route") == "todo":
+            requested_date = date_from_request_metadata(agent_context)
+            result["todos"] = filter_todos_from_date(result.get("todos", []), requested_date)
+            result["calendar_events"] = store_todos_to_calendar(
+                result.get("todos", []),
+                req.message,
+                request_id=agent_context.get("request_id"),
+                requested_date=requested_date,
+            )
         return ChatResponse(**result)
     except Exception as exc:
         logging.getLogger(__name__).exception("chat failed: %s", exc)
@@ -81,6 +101,17 @@ def graph_mermaid() -> str:
 @app.get("/api/sources")
 def sources():
     return {"sources": settings.default_sources}
+
+
+@app.get("/api/profile/{session_id}", response_model=ProfileResponse)
+def read_profile(session_id: str):
+    return ProfileResponse(profile=get_profile(session_id))
+
+
+@app.post("/api/profile", response_model=ProfileResponse)
+def save_profile(profile: ProfileSettings):
+    saved = upsert_profile(profile)
+    return ProfileResponse(profile=saved, message="프로필 설정을 저장했습니다.")
 
 
 @app.post("/api/profile/upload", response_model=UploadResponse)
@@ -139,8 +170,9 @@ def changes():
 
 @app.post("/api/todos/breakdown", response_model=TodoBreakdownResponse)
 def todos_breakdown(req: TodoBreakdownRequest):
-    todos = breakdown_todos(req.goal)
-    calendar_events = store_todos_to_calendar(todos, req.goal)
+    requested_date = date.today()
+    todos = filter_todos_from_date(breakdown_todos(req.goal, reference_date=requested_date), requested_date)
+    calendar_events = store_todos_to_calendar(todos, req.goal, requested_date=requested_date)
     return TodoBreakdownResponse(todos=todos, calendar_events=calendar_events)
 
 
@@ -183,21 +215,40 @@ def store_events_to_calendar(events: list[dict]) -> list[dict]:
     return stored_events
 
 
-def store_todos_to_calendar(todos: list, goal: str) -> list[dict]:
+def store_todos_to_calendar(
+    todos: list,
+    goal: str,
+    request_id: str | None = None,
+    requested_date: date | None = None,
+) -> list[dict]:
     stored_events: list[dict] = []
+    requested_date = requested_date or date.today()
     with connect() as conn:
         for todo in todos:
-            if not todo.due_date:
+            due_date = todo_value(todo, "due_date")
+            if not due_date:
                 continue
+            try:
+                due_day = date.fromisoformat(due_date)
+            except ValueError:
+                continue
+            if due_day < requested_date:
+                continue
+            title = todo_value(todo, "title") or "할 일"
+            priority = todo_value(todo, "priority") or "medium"
+            reason = todo_value(todo, "reason") or ""
+            evidence = f"{goal} - {reason}"
+            if request_id:
+                evidence = f"[request:{request_id}] {evidence}"
             event = {
-                "title": f"TODO: {todo.title}",
+                "title": f"TODO: {title}",
                 "category": "Todo",
-                "start_date": todo.due_date,
+                "start_date": due_date,
                 "end_date": None,
-                "deadline": todo.due_date,
-                "importance": todo.priority,
+                "deadline": due_date,
+                "importance": priority,
                 "source_url": None,
-                "evidence": f"{goal} - {todo.reason}",
+                "evidence": evidence,
                 "change_type": "todo",
             }
             event_id = insert_calendar_event(conn, event)
@@ -210,10 +261,41 @@ def store_todos_to_calendar(todos: list, goal: str) -> list[dict]:
                       AND COALESCE(deadline, start_date, end_date, '') = ?
                     LIMIT 1
                     """,
-                    (event["title"], todo.due_date),
+                    (event["title"], due_date),
                 ).fetchone()
                 event_id = int(existing["id"]) if existing else 0
             if event_id:
                 stored_events.append({**event, "id": event_id})
         conn.commit()
     return stored_events
+
+
+def todo_value(todo, key: str):
+    if isinstance(todo, dict):
+        return todo.get(key)
+    return getattr(todo, key, None)
+
+
+def date_from_request_metadata(metadata: dict | None) -> date:
+    requested_at = (metadata or {}).get("requested_at")
+    if not requested_at:
+        return date.today()
+    try:
+        return datetime.fromisoformat(requested_at).date()
+    except ValueError:
+        return date.today()
+
+
+def filter_todos_from_date(todos: list, requested_date: date) -> list:
+    filtered = []
+    for todo in todos:
+        due_date = todo_value(todo, "due_date")
+        if not due_date:
+            continue
+        try:
+            due_day = date.fromisoformat(due_date)
+        except ValueError:
+            continue
+        if due_day >= requested_date:
+            filtered.append(todo)
+    return filtered

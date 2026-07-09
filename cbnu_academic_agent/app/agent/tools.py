@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any
 
 from langchain_core.documents import Document
@@ -64,9 +65,15 @@ def date_calculator_tool(date_text: str) -> str:
 
 
 @tool
-def todo_breakdown_tool(goal: str) -> list[dict[str, str | None]]:
+def todo_breakdown_tool(goal: str, reference_date: str | None = None) -> list[dict[str, str | None]]:
     """학사 일정이나 목표를 실행 가능한 Todo 목록으로 분해한다."""
-    return [todo.model_dump() for todo in breakdown_todos(goal)]
+    parsed_date = None
+    if reference_date:
+        try:
+            parsed_date = date.fromisoformat(reference_date)
+        except ValueError:
+            parsed_date = None
+    return [todo.model_dump() for todo in breakdown_todos(goal, reference_date=parsed_date)]
 
 
 def find_first_date(text: str) -> str | None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from uuid import uuid4
 
 from fastapi import Request
@@ -13,7 +14,17 @@ logger = logging.getLogger("cbnu_agent.request")
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = str(uuid4())[:8]
+        requested_at = datetime.now().isoformat(timespec="seconds")
         start = time.perf_counter()
+        request.state.request_id = request_id
+        request.state.requested_at = requested_at
+        if request.url.path == "/api/chat":
+            request.state.agent_context = {
+                "request_id": request_id,
+                "requested_at": requested_at,
+                "method": request.method,
+                "path": request.url.path,
+            }
         logger.info("request_start id=%s method=%s path=%s", request_id, request.method, request.url.path)
         try:
             response = await call_next(request)

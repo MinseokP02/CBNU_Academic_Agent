@@ -26,12 +26,18 @@
 
     <section class="panel-grid">
       <div class="panel">
-        <h2>Profile PDF</h2>
-        <form id="upload-form" class="inline-form">
-          <input id="profile-pdf" type="file" accept="application/pdf" />
-          <button type="submit">업로드</button>
+        <h2>Profile</h2>
+        <form id="profile-form" class="profile-form">
+          <input id="profile-name" type="text" placeholder="이름" autocomplete="off" />
+          <input id="profile-college" type="text" placeholder="단과대학" autocomplete="off" />
+          <input id="profile-department" type="text" placeholder="학과" autocomplete="off" />
+          <input id="profile-grade" type="text" placeholder="학년" autocomplete="off" />
+          <input id="profile-student-type" type="text" placeholder="학적/구분" autocomplete="off" />
+          <input id="profile-interests" type="text" placeholder="관심 항목: 수강, 장학, 졸업" autocomplete="off" />
+          <textarea id="profile-memo" placeholder="추가 메모"></textarea>
+          <button type="submit">저장</button>
         </form>
-        <p id="upload-status" class="status-text"></p>
+        <p id="profile-status" class="status-text"></p>
       </div>
 
       <div class="panel">
@@ -42,11 +48,9 @@
 
       <div class="panel">
         <h2>Todo</h2>
-        <form id="todo-form" class="inline-form">
-          <input id="todo-goal" type="text" placeholder="예: 장학금 신청 준비" autocomplete="off" />
-          <button type="submit">분해</button>
-        </form>
-        <ul id="todo-list" class="compact-list"></ul>
+        <ul id="todo-list" class="compact-list">
+          <li class="todo-calendar-result"><b>채팅으로 요청</b><span>할 일 분해가 필요하면 채팅창에 요청해 주세요.</span></li>
+        </ul>
       </div>
     </section>
 

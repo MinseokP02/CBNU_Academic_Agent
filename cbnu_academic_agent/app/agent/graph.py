@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date, datetime
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
@@ -20,6 +21,7 @@ from app.agent.tools import (
 )
 from app.config import get_settings
 from app.schemas import AcademicScheduleList, RouteDecision, SourceItem
+from app.services.profile_store import format_profile_context
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +35,10 @@ class AgentState(TypedDict, total=False):
     raw_docs: list[dict[str, Any]]
     context_docs: list[dict[str, Any]]
     schedules: list[dict[str, Any]]
+    todos: list[dict[str, Any]]
     answer: str
     iterations: int
+    request_metadata: dict[str, Any]
 
 
 def get_llm(temperature: float = 0.1) -> ChatOpenAI:
@@ -53,6 +57,7 @@ def classify_request(state: AgentState) -> dict[str, Any]:
     """사용자 요청을 보고 어떤 도구 흐름을 탈지 결정한다."""
     query = _latest_user_message(state)
     llm = get_llm(temperature=0)
+    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
 
     system = SystemMessage(
         content=(
@@ -64,10 +69,11 @@ def classify_request(state: AgentState) -> dict[str, Any]:
             "guardrail은 서비스 범위 밖 요청이다. 검색어는 한국어로 간결하게 재작성한다."
         )
     )
+    profile_message = SystemMessage(content=f"사용자 프로필:\n{profile_context}")
 
     try:
         decision = llm.with_structured_output(RouteDecision).invoke(
-            [system, *state.get("messages", [])]
+            [system, profile_message, *state.get("messages", [])]
         )
     except Exception as exc:  # API 일시 오류 시 키워드 기반 fallback
         logger.exception("route classification failed: %s", exc)
@@ -96,12 +102,18 @@ def route_condition(state: AgentState) -> str:
 
 def crawl_node(state: AgentState) -> dict[str, Any]:
     query = state.get("rewritten_query") or state.get("query") or _latest_user_message(state)
+    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
+    if profile_context != "설정된 사용자 프로필 없음":
+        query = f"{query}\n{profile_context}"
     docs = realtime_cbnu_crawl_tool.invoke({"query": query})
     return {"raw_docs": docs, "iterations": state.get("iterations", 0) + 1}
 
 
 def rag_search_node(state: AgentState) -> dict[str, Any]:
     query = state.get("rewritten_query") or state.get("query") or _latest_user_message(state)
+    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
+    if profile_context != "설정된 사용자 프로필 없음":
+        query = f"{query}\n{profile_context}"
     docs = state.get("raw_docs", [])
     results = runtime_rag_search_tool.invoke({"query": query, "documents": docs, "k": 5})
     return {"context_docs": results}
@@ -166,6 +178,7 @@ def answer_node(state: AgentState) -> dict[str, Any]:
     context_docs = state.get("context_docs", [])
     schedules = state.get("schedules", [])
     query = state.get("query") or _latest_user_message(state)
+    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
 
     context_text = "\n\n".join(
         f"[문서 {idx + 1}] {doc.get('title')}\nURL: {doc.get('source')}\n{doc.get('content', '')[:1400]}"
@@ -180,16 +193,24 @@ def answer_node(state: AgentState) -> dict[str, Any]:
                 "system",
                 "너는 충북대학교 학생을 위한 학사 일정 관리 Agent다. "
                 "검색 문맥에 근거해서만 답하고, 불확실하면 불확실하다고 말한다. "
+                "사용자 프로필이 있으면 학과, 학년, 관심 항목과 관련성이 높은 내용을 우선해서 답한다. "
                 "중요 일정은 날짜, 마감일, 해야 할 일을 중심으로 정리한다. "
                 "마지막에는 확인한 출처 제목을 짧게 제시한다."
             ),
             (
                 "human",
-                "사용자 질문: {query}\n\n추출된 일정 JSON:\n{schedule_json}\n\n검색 문맥:\n{context}\n\n답변:",
+                "사용자 프로필:\n{profile_context}\n\n사용자 질문: {query}\n\n추출된 일정 JSON:\n{schedule_json}\n\n검색 문맥:\n{context}\n\n답변:",
             ),
         ]
     )
-    result = (prompt | llm).invoke({"query": query, "schedule_json": schedule_json, "context": context_text})
+    result = (prompt | llm).invoke(
+        {
+            "profile_context": profile_context,
+            "query": query,
+            "schedule_json": schedule_json,
+            "context": context_text,
+        }
+    )
     content = str(result.content)
     return {"answer": content, "messages": [AIMessage(content=content)]}
 
@@ -214,15 +235,54 @@ def guardrail_node(state: AgentState) -> dict[str, Any]:
 
 def todo_node(state: AgentState) -> dict[str, Any]:
     query = state.get("query") or _latest_user_message(state)
-    todos = todo_breakdown_tool.invoke({"goal": query})
-    lines = ["다음 순서로 처리하면 좋습니다."]
+    requested_date = date_from_request_metadata(state.get("request_metadata", {}))
+    profile_context = format_profile_context(state.get("request_metadata", {}).get("profile"))
+    goal = query if profile_context == "설정된 사용자 프로필 없음" else f"{query}\n\n사용자 프로필:\n{profile_context}"
+    todos = todo_breakdown_tool.invoke({"goal": goal, "reference_date": requested_date.isoformat()})
+    todos = filter_todos_from_date(todos, requested_date)
+    content = format_todo_answer(todos, requested_date)
+    return {"answer": content, "todos": todos, "messages": [AIMessage(content=content)]}
+
+
+def format_todo_answer(todos: list[dict[str, Any]], requested_date: date) -> str:
+    if not todos:
+        return (
+            f"{requested_date.isoformat()} 이후로 표시할 Todo 날짜를 찾지 못했습니다. "
+            "먼저 관련 학사 일정/공지 동기화를 하거나, 목표에 마감일을 함께 입력해 주세요."
+        )
+
+    lines = [f"{requested_date.isoformat()} 이후 기준으로 다음 순서로 처리하면 좋습니다."]
     for idx, todo in enumerate(todos, start=1):
         due_date = todo.get("due_date") or "날짜 미정"
         lines.append(f"{idx}. {todo.get('title')} ({due_date}, {todo.get('priority')})")
         if todo.get("reason"):
             lines.append(f"   - {todo.get('reason')}")
-    content = "\n".join(lines)
-    return {"answer": content, "messages": [AIMessage(content=content)]}
+    return "\n".join(lines)
+
+
+def date_from_request_metadata(metadata: dict[str, Any] | None) -> date:
+    requested_at = (metadata or {}).get("requested_at")
+    if not requested_at:
+        return date.today()
+    try:
+        return datetime.fromisoformat(str(requested_at)).date()
+    except ValueError:
+        return date.today()
+
+
+def filter_todos_from_date(todos: list[dict[str, Any]], requested_date: date) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for todo in todos:
+        due_date = todo.get("due_date")
+        if not due_date:
+            continue
+        try:
+            due_day = date.fromisoformat(str(due_date))
+        except ValueError:
+            continue
+        if due_day >= requested_date:
+            filtered.append(todo)
+    return filtered
 
 
 def build_graph():
@@ -272,10 +332,19 @@ def build_graph():
 agent_graph = build_graph()
 
 
-def invoke_agent(message: str, session_id: str = "default") -> dict[str, Any]:
+def invoke_agent(
+    message: str,
+    session_id: str = "default",
+    request_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     config = {"configurable": {"thread_id": session_id}}
     result = agent_graph.invoke(
-        {"messages": [HumanMessage(content=message)], "query": message, "iterations": 0},
+        {
+            "messages": [HumanMessage(content=message)],
+            "query": message,
+            "iterations": 0,
+            "request_metadata": request_metadata or {},
+        },
         config=config,
     )
 
@@ -295,4 +364,6 @@ def invoke_agent(message: str, session_id: str = "default") -> dict[str, Any]:
         "route": result.get("route", "unknown"),
         "sources": sources,
         "schedules": result.get("schedules", []),
+        "todos": result.get("todos", []),
+        "calendar_events": [],
     }

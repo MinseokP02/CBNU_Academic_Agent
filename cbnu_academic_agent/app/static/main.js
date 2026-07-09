@@ -1,9 +1,17 @@
 const form = document.getElementById("chat-form");
 const input = document.getElementById("message");
 const messages = document.getElementById("messages");
-const uploadForm = document.getElementById("upload-form");
-const profilePdf = document.getElementById("profile-pdf");
-const uploadStatus = document.getElementById("upload-status");
+const profileForm = document.getElementById("profile-form");
+const profileStatus = document.getElementById("profile-status");
+const profileFields = {
+  name: document.getElementById("profile-name"),
+  college: document.getElementById("profile-college"),
+  department: document.getElementById("profile-department"),
+  grade: document.getElementById("profile-grade"),
+  student_type: document.getElementById("profile-student-type"),
+  interests: document.getElementById("profile-interests"),
+  memo: document.getElementById("profile-memo"),
+};
 const syncBtn = document.getElementById("sync-btn");
 const syncStatus = document.getElementById("sync-status");
 const calendarSummary = document.getElementById("calendar-summary");
@@ -16,8 +24,6 @@ const nextMonth = document.getElementById("next-month");
 const toggleCalendarRange = document.getElementById("toggle-calendar-range");
 const refreshCalendar = document.getElementById("refresh-calendar");
 const refreshChanges = document.getElementById("refresh-changes");
-const todoForm = document.getElementById("todo-form");
-const todoGoal = document.getElementById("todo-goal");
 const todoList = document.getElementById("todo-list");
 const sessionId = localStorage.getItem("cbnu_session_id") || crypto.randomUUID();
 localStorage.setItem("cbnu_session_id", sessionId);
@@ -71,7 +77,10 @@ form.addEventListener("submit", async (e) => {
     }
     addMessage("assistant", data.answer);
     addSources(data.sources);
-    if (data.schedules && data.schedules.length > 0) {
+    if (data.todos && data.todos.length > 0) {
+      renderTodoResult(data.todos, data.calendar_events || []);
+    }
+    if ((data.schedules && data.schedules.length > 0) || (data.calendar_events && data.calendar_events.length > 0)) {
       loadCalendar();
     }
   } catch (err) {
@@ -79,24 +88,52 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
-uploadForm.addEventListener("submit", async (e) => {
+profileForm.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const file = profilePdf.files[0];
-  if (!file) {
-    uploadStatus.textContent = "PDF 파일을 선택하세요.";
-    return;
-  }
-
-  const body = new FormData();
-  body.append("file", file);
-  uploadStatus.textContent = "업로드 중...";
-
-  const res = await fetch("/api/profile/upload", { method: "POST", body });
+  profileStatus.textContent = "저장 중...";
+  const payload = collectProfilePayload();
+  const res = await fetch("/api/profile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
   const data = await res.json();
-  uploadStatus.textContent = res.ok
-    ? `${data.filename} 저장 완료 (${data.chunks} chunks)`
-    : data.detail || "업로드 실패";
+  profileStatus.textContent = res.ok
+    ? data.message || "프로필 저장 완료"
+    : data.detail || "프로필 저장 실패";
 });
+
+function collectProfilePayload() {
+  return {
+    session_id: sessionId,
+    name: emptyToNull(profileFields.name.value),
+    college: emptyToNull(profileFields.college.value),
+    department: emptyToNull(profileFields.department.value),
+    grade: emptyToNull(profileFields.grade.value),
+    student_type: emptyToNull(profileFields.student_type.value),
+    interests: profileFields.interests.value.split(",").map((item) => item.trim()).filter(Boolean),
+    memo: profileFields.memo.value.trim(),
+  };
+}
+
+function emptyToNull(value) {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+async function loadProfile() {
+  const res = await fetch(`/api/profile/${encodeURIComponent(sessionId)}`);
+  if (!res.ok) return;
+  const data = await res.json();
+  const profile = data.profile || {};
+  profileFields.name.value = profile.name || "";
+  profileFields.college.value = profile.college || "";
+  profileFields.department.value = profile.department || "";
+  profileFields.grade.value = profile.grade || "";
+  profileFields.student_type.value = profile.student_type || "";
+  profileFields.interests.value = (profile.interests || []).join(", ");
+  profileFields.memo.value = profile.memo || "";
+}
 
 syncBtn.addEventListener("click", async () => {
   syncStatus.textContent = "동기화 중...";
@@ -111,31 +148,16 @@ syncBtn.addEventListener("click", async () => {
   loadChanges();
 });
 
-todoForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const goal = todoGoal.value.trim();
-  if (!goal) return;
-  todoList.innerHTML = "<li>분해 중...</li>";
-  const res = await fetch("/api/todos/breakdown", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ goal }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    todoList.innerHTML = `<li>${data.detail || "Todo 생성 실패"}</li>`;
-    return;
-  }
-  const scheduledTodos = data.todos.filter((todo) => todo.due_date);
+function renderTodoResult(todos, calendarEvents) {
+  const scheduledTodos = todos.filter((todo) => todo.due_date);
   if (scheduledTodos.length === 0) {
     todoList.innerHTML = `<li class="todo-calendar-result"><b>Calendar 작성 안 됨</b><span>현재 날짜 이후의 관련 일정이 없어 Todo 날짜를 지정하지 않았습니다.</span></li>`;
     return;
   }
   todoList.innerHTML = scheduledTodos.map((todo) => (
     `<li><b>${todo.title}</b><span>${todo.due_date} · ${todo.priority}</span><small>${todo.reason || ""}</small></li>`
-  )).join("") + `<li class="todo-calendar-result"><b>Calendar 작성 완료</b><span>${data.calendar_events.length}개 Todo가 달력에 반영되었습니다.</span></li>`;
-  loadCalendar();
-});
+  )).join("") + `<li class="todo-calendar-result"><b>Calendar 작성 완료</b><span>${calendarEvents.length}개 Todo가 달력에 반영되었습니다.</span></li>`;
+}
 
 refreshCalendar.addEventListener("click", loadCalendar);
 prevMonth.addEventListener("click", () => {
@@ -331,3 +353,4 @@ async function loadChanges() {
 
 loadCalendar();
 loadChanges();
+loadProfile();

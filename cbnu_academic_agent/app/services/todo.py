@@ -18,17 +18,20 @@ class TodoPlan(BaseModel):
     todos: list[TodoItem] = Field(default_factory=list)
 
 
-def breakdown_todos(goal: str) -> list[TodoItem]:
+def breakdown_todos(goal: str, reference_date: date | None = None) -> list[TodoItem]:
     settings = get_settings()
+    reference_date = reference_date or datetime.now().date()
     related_events = find_calendar_events_for_text(goal)
     if not settings.openai_api_key:
-        return assign_due_dates(fallback_todos(goal), related_events)
+        return assign_due_dates(fallback_todos(goal), related_events, reference_date)
 
     llm = ChatOpenAI(model=settings.openai_model, temperature=0)
     system = SystemMessage(
         content=(
             "너는 충북대학교 학생의 학사 업무를 실행 가능한 Todo로 쪼개는 플래너다. "
             "각 Todo는 한 번에 실행 가능한 짧은 행동이어야 한다. "
+            f"오늘 날짜는 {reference_date.isoformat()}이다. "
+            "due_date는 오늘 날짜 이후 또는 오늘 날짜로만 지정한다. "
             "참고 일정이 있으면 그 날짜를 기준으로 due_date를 YYYY-MM-DD로 넣는다. "
             "마감/신청/제출 Todo는 관련 일정의 deadline 또는 start_date 이전으로 잡는다."
         )
@@ -42,10 +45,10 @@ def breakdown_todos(goal: str) -> list[TodoItem]:
 
     try:
         plan = llm.with_structured_output(TodoPlan).invoke([system, human])
-        return assign_due_dates(plan.todos, related_events)
+        return assign_due_dates(plan.todos, related_events, reference_date)
     except Exception as exc:
         logger.exception("todo breakdown failed: %s", exc)
-        return assign_due_dates(fallback_todos(goal), related_events)
+        return assign_due_dates(fallback_todos(goal), related_events, reference_date)
 
 
 def fallback_todos(goal: str) -> list[TodoItem]:
@@ -56,22 +59,22 @@ def fallback_todos(goal: str) -> list[TodoItem]:
     ]
 
 
-def assign_due_dates(todos: list[TodoItem], related_events: list[dict]) -> list[TodoItem]:
+def assign_due_dates(todos: list[TodoItem], related_events: list[dict], reference_date: date | None = None) -> list[TodoItem]:
+    today = reference_date or datetime.now().date()
     if not related_events:
-        return todos
+        return clear_past_due_dates(todos, today)
 
-    primary_event = first_future_event(related_events)
+    primary_event = first_future_event(related_events, today)
     if not primary_event:
-        return todos
+        return clear_past_due_dates(todos, today)
 
     event_date = primary_event.get("deadline") or primary_event.get("start_date") or primary_event.get("end_date")
     if not event_date:
-        return todos
+        return clear_past_due_dates(todos, today)
     event_day = date.fromisoformat(event_date)
-    today = datetime.now().date()
     last_todo_day = event_day - timedelta(days=1)
     if last_todo_day < today:
-        return todos
+        return clear_past_due_dates(todos, today)
 
     schedule_dates = distribute_dates(today, last_todo_day, len(todos))
 
@@ -102,8 +105,8 @@ def assign_due_dates(todos: list[TodoItem], related_events: list[dict]) -> list[
     return result
 
 
-def first_future_event(events: list[dict]) -> dict | None:
-    today = datetime.now().date()
+def first_future_event(events: list[dict], reference_date: date | None = None) -> dict | None:
+    today = reference_date or datetime.now().date()
     for event in events:
         event_date = event.get("deadline") or event.get("start_date") or event.get("end_date")
         if not event_date:
@@ -111,6 +114,24 @@ def first_future_event(events: list[dict]) -> dict | None:
         if date.fromisoformat(event_date) > today:
             return event
     return None
+
+
+def clear_past_due_dates(todos: list[TodoItem], reference_date: date) -> list[TodoItem]:
+    result: list[TodoItem] = []
+    for todo in todos:
+        if not todo.due_date:
+            result.append(todo)
+            continue
+        try:
+            todo_day = date.fromisoformat(todo.due_date)
+        except ValueError:
+            result.append(todo.model_copy(update={"due_date": None}))
+            continue
+        if todo_day >= reference_date:
+            result.append(todo)
+        else:
+            result.append(todo.model_copy(update={"due_date": None}))
+    return result
 
 
 def distribute_dates(start: date, end: date, count: int) -> list[date]:
